@@ -108,6 +108,7 @@ class PacerSession(requests.Session):
         username=None,
         password=None,
         client_code=None,
+        otp_code=None,
         get_acms_tokens=False,
     ):
         """
@@ -116,6 +117,9 @@ class PacerSession(requests.Session):
         :param username: a PACER account username
         :param password: a PACER account password
         :param client_code: an optional PACER client code for the session
+        :param otp_code: an optional one-time passcode (TOTP) for accounts with
+        multi-factor authentication (MFA) enabled. Because the code is
+        time-based, it must be current at the moment login() is called.
         :param get_acms_tokens: boolean flag to enable ACMS authentication during login.
         """
         super().__init__()
@@ -133,6 +137,7 @@ class PacerSession(requests.Session):
         self.username = username
         self.password = password
         self.client_code = client_code
+        self.otp_code = otp_code
         self.additional_request_done = False
         self.get_acms_tokens = get_acms_tokens
         self.acms_user_data = {}
@@ -376,6 +381,11 @@ class PacerSession(requests.Session):
         # If optional client code information is included, include in login request
         if self.client_code:
             data["clientCode"] = self.client_code
+
+        # If the account has multi-factor authentication (MFA) enabled, include
+        # the current one-time passcode from the user's authenticator app.
+        if self.otp_code:
+            data["otpCode"] = self.otp_code
 
         headers = {
             "User-Agent": "Juriscraper",

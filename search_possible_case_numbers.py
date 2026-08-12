@@ -38,9 +38,13 @@ logger = make_default_logger()
 RESULT_KEYS = ("docket_number", "pacer_case_id", "title")
 
 
-def make_session():
+def make_session(use_mfa=False):
     """Build and log in to a PACER session using environment credentials.
 
+    :param use_mfa: If True, obtain a one-time passcode (TOTP) for accounts
+        with multi-factor authentication enabled. The code is read from the
+        PACER_OTP environment variable if set, otherwise the user is prompted
+        for it interactively so that it is current at login time.
     :return: A logged-in ``PacerSession``.
     """
     username = os.environ.get("PACER_USERNAME")
@@ -51,7 +55,22 @@ def make_session():
             "variables before running this script."
         )
 
-    session = PacerSession(username=username, password=password)
+    otp_code = None
+    if use_mfa:
+        otp_code = os.environ.get("PACER_OTP")
+        if not otp_code:
+            # TOTP codes expire every ~30 seconds, so prompt for it right
+            # before logging in rather than reading a stale value.
+            otp_code = input(
+                "Enter the current 6-digit PACER MFA passcode from your "
+                "authenticator app: "
+            ).strip()
+        if not otp_code:
+            sys.exit("MFA was requested but no passcode was provided.")
+
+    session = PacerSession(
+        username=username, password=password, otp_code=otp_code
+    )
     logger.info("Logging in to PACER as %s", username)
     session.login()
     return session
@@ -103,6 +122,16 @@ def main():
             "billable PACER request). Default: process all cases."
         ),
     )
+    parser.add_argument(
+        "--mfa",
+        action="store_true",
+        help=(
+            "Use this if your PACER account has multi-factor authentication "
+            "(MFA) enabled. The script will read the current one-time "
+            "passcode from the PACER_OTP environment variable, or prompt you "
+            "for it at startup."
+        ),
+    )
     args = parser.parse_args()
 
     if args.limit is not None and args.limit < 1:
@@ -121,7 +150,7 @@ def main():
     if args.limit is not None:
         cases = cases[: args.limit]
 
-    session = make_session()
+    session = make_session(use_mfa=args.mfa)
 
     total = len(cases)
     found = 0
