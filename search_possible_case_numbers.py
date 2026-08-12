@@ -93,7 +93,20 @@ def main():
         default=0.0,
         help="Seconds to sleep between PACER requests (default: 0).",
     )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help=(
+            "Only process the first N cases from the input. Useful for a "
+            "cheap test run before querying every case (each lookup is a "
+            "billable PACER request). Default: process all cases."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.limit is not None and args.limit < 1:
+        sys.exit("--limit must be a positive integer.")
 
     output_path = args.output or (
         os.path.splitext(args.input)[0] + ".with_pacer.json"
@@ -104,6 +117,9 @@ def main():
 
     if not isinstance(cases, list):
         sys.exit("Expected the input JSON to be a list of case objects.")
+
+    if args.limit is not None:
+        cases = cases[: args.limit]
 
     session = make_session()
 
