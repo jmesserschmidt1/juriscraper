@@ -20,10 +20,12 @@ accurate than fetching a separate attachment page per document. Two small
 subclasses extend the stock parsers where they still drop data this script
 wants: ``AttachmentDocketReport`` keeps Juriscraper's rich structured
 attachments and, for a plain report that lacks them, falls back to the inline
-``(Attachments: ...)`` links; ``TerminationDocketHistoryReport`` adds the
-per-entry ``Terminated:`` date the history report shows on some motions. Both
-only add keys -- all of Juriscraper's existing parsed output is preserved
-untouched.
+``(Attachments: ...)`` links, and it also adds the docket sheet's ``flags``
+(the codes shown at the top, e.g. ECF, LEAD) and its ``member_cases`` /
+``related_cases`` lists (each with docket number, court, and pacer_case_id);
+``TerminationDocketHistoryReport`` adds the per-entry ``Terminated:`` date the
+history report shows on some motions. Both only add keys -- all of
+Juriscraper's existing parsed output is preserved untouched.
 
 For each report we download the raw HTML exactly as PACER served it, write it
 to disk, and then parse that saved HTML into a JSON document. Parsing is done
@@ -234,6 +236,88 @@ class AttachmentDocketReport(DocketReport):
             return super().query(*args, **kwargs)
         finally:
             self.session.post = original_post
+
+    @property
+    def metadata(self):
+        data = super().metadata
+        # Enrich the (cached) metadata once with data the stock parser drops:
+        # the docket sheet's flag codes and its member / related case lists.
+        if data and "flags" not in data:
+            data["flags"] = self._parse_flags()
+            member_cases, related_cases = self._parse_case_references()
+            data["member_cases"] = member_cases
+            data["related_cases"] = related_cases
+        return data
+
+    def _parse_flags(self):
+        """Parse the flag codes shown at the top of the docket sheet.
+
+        PACER renders them as ``<span>`` codes in a right-aligned cell just
+        above the case caption, e.g. ``ECF``, ``LEAD``.
+
+        :return: A list of flag code strings (empty if the case has none).
+        """
+        spans = self.tree.xpath(
+            '//h3/preceding-sibling::table[1]//span/text()'
+        )
+        return [flag for flag in (clean_string(s) for s in spans) if flag]
+
+    def _parse_case_references(self):
+        """Parse the caption's "Member case" and "Related Case" links.
+
+        Both appear near the case caption as links to other cases' docket
+        reports (``DktRpt.pl?<pacer_case_id>``), with the sibling case's docket
+        number as the link text. A link is a related case when its nearest
+        enclosing table is the "Related Case" table (note PACER writes that
+        label with a non-breaking space); otherwise it is a member case. Only
+        links within the caption (which carries the "Member" / "Related" labels)
+        are considered, so docket-entry links are ignored.
+
+        :return: A two-tuple ``(member_cases, related_cases)``, each a list of
+        dicts with ``docket_number``, ``court_id``, and ``pacer_case_id``.
+        """
+        member_cases, related_cases = [], []
+        seen_member, seen_related = set(), set()
+        for anchor in self.tree.xpath('//a[contains(@href, "DktRpt.pl?")]'):
+            href = anchor.get("href", "")
+            # A case link's query is exactly the pacer_case_id (all digits).
+            # This excludes the "Select all / clear" buttons, whose query is a
+            # session id like "100591727900924-L_1_0-1".
+            id_match = re.search(r"DktRpt\.pl\?(\d+)(?:[#&]|$)", href)
+            docket_number = clean_string(anchor.text_content())
+            if not id_match or not docket_number:
+                continue
+
+            tables_text = " ".join(
+                t.text_content() for t in anchor.xpath("./ancestor::table")
+            ).replace("\xa0", " ")
+            # Only caption links carry these labels; skip anything else.
+            if "Member" not in tables_text and "Related" not in tables_text:
+                continue
+
+            court_match = re.search(r"ecf\.([^.]+)\.uscourts\.gov", href)
+            entry = {
+                "docket_number": docket_number,
+                "court_id": court_match.group(1)
+                if court_match
+                else self.court_id,
+                "pacer_case_id": id_match.group(1),
+            }
+
+            nearest_tables = anchor.xpath("./ancestor::table")
+            nearest_text = (
+                nearest_tables[-1].text_content().replace("\xa0", " ")
+                if nearest_tables
+                else ""
+            )
+            if "Related" in nearest_text:
+                if entry["pacer_case_id"] not in seen_related:
+                    seen_related.add(entry["pacer_case_id"])
+                    related_cases.append(entry)
+            elif entry["pacer_case_id"] not in seen_member:
+                seen_member.add(entry["pacer_case_id"])
+                member_cases.append(entry)
+        return member_cases, related_cases
 
     @property
     def docket_entries(self):
