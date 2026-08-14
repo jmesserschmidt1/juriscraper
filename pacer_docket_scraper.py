@@ -19,6 +19,24 @@ from the file on disk (not the in-memory response) to demonstrate that the
 download and parse steps are independent -- you can re-parse saved HTML at any
 time without touching PACER again.
 
+Multi-factor authentication (MFA)
+---------------------------------
+PACER accounts can require a one-time passcode (OTP) in addition to the
+username and password. The PACER Authentication API takes the OTP in the same
+login request as the ``otpCode`` field -- there is no separate challenge step.
+Juriscraper's stock ``PacerSession.login`` does not send ``otpCode``, so this
+script adds a small ``MfaPacerSession`` subclass that injects it.
+
+Because authenticator-app codes rotate roughly every 30 seconds and backup
+codes are single-use, the OTP has to be fresh at the moment of login. This
+script therefore acquires it as late as possible (an interactive prompt right
+before logging in, unless you pass ``--otp`` / ``PACER_OTP``). One consequence:
+Juriscraper's automatic mid-session re-login cannot work for MFA accounts,
+since it has no way to obtain a new OTP on its own. That only matters if the
+session cookie expires mid-run; for a single case it will not. If you hit a
+``PacerLoginException`` partway through a long job, just re-run with a fresh
+code.
+
 Usage::
 
     export PACER_USERNAME=your_username
@@ -29,7 +47,13 @@ Usage::
         --docket-number 4:06-cv-07294 \
         --output-dir ./pacer_output
 
-Credentials may also be supplied with ``--username`` / ``--password``.
+    # With MFA: you'll be prompted for the one-time passcode, or pass it in:
+    python pacer_docket_scraper.py --court cand \
+        --docket-number 4:06-cv-07294 --otp 123456
+
+Credentials may also be supplied with ``--username`` / ``--password``. When the
+password or OTP is omitted and the script is run interactively, it prompts for
+them (the password without echo) rather than reading them off the command line.
 
 NOTE: PACER is a paid service. Running this against the live system incurs
 charges for the docket pages it retrieves. There is no free "test" mode here;
@@ -38,6 +62,7 @@ point it at a case you actually intend to purchase.
 
 import argparse
 import datetime
+import getpass
 import json
 import logging
 import os
@@ -54,6 +79,37 @@ from juriscraper.pacer.http import PacerSession
 logger = make_default_logger()
 
 
+class MfaPacerSession(PacerSession):
+    """A ``PacerSession`` that can submit a one-time passcode (OTP) at login.
+
+    The PACER Authentication API accepts the OTP for MFA-enabled accounts as an
+    ``otpCode`` field in the same JSON body as the username and password. The
+    stock ``PacerSession`` builds that body internally and offers no hook to add
+    fields, so rather than copy its ~80-line ``login`` method (and risk drifting
+    from upstream), we override the one small seam where the request is sent and
+    splice ``otpCode`` into the JSON. All of the parent's response parsing and
+    cookie handling is reused untouched.
+    """
+
+    def __init__(self, *args, otp_code=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.otp_code = otp_code
+
+    def _prepare_login_request(self, url, data, headers, *args, **kwargs):
+        """Inject ``otpCode`` into the login payload before it is sent.
+
+        :param data: The JSON-encoded login body assembled by ``login``.
+        :return: The parent's response, sent with the OTP added when present.
+        """
+        if self.otp_code:
+            payload = json.loads(data)
+            payload["otpCode"] = self.otp_code
+            data = json.dumps(payload)
+        return super()._prepare_login_request(
+            url, data, headers, *args, **kwargs
+        )
+
+
 def json_serializer(obj):
     """Fallback serializer so ``json.dump`` can handle the ``date`` and
     ``datetime`` objects that the Juriscraper parsers return.
@@ -65,6 +121,72 @@ def json_serializer(obj):
     if isinstance(obj, (datetime.date, datetime.datetime)):
         return obj.isoformat()
     raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+
+def resolve_password(cli_password):
+    """Return the PACER password, prompting (without echo) if needed.
+
+    Precedence: ``--password`` flag / ``PACER_PASSWORD`` env var, then an
+    interactive ``getpass`` prompt when running on a TTY. Returns None when no
+    password can be obtained.
+
+    :param cli_password: The value from --password (already defaulted to the
+    PACER_PASSWORD env var by argparse), or None.
+    :return: The password string, or None.
+    """
+    if cli_password:
+        return cli_password
+    if sys.stdin.isatty():
+        return getpass.getpass("PACER password: ") or None
+    return None
+
+
+def resolve_otp(cli_otp):
+    """Return the one-time passcode to submit with login, or None.
+
+    Precedence: ``--otp`` flag, then the ``PACER_OTP`` env var, then an
+    interactive prompt (only when stdin is a TTY). Authenticator-app codes
+    rotate every ~30 seconds and backup codes are single-use, so when prompting
+    we do it immediately before login to keep the code fresh. Returns None when
+    no OTP is supplied, which is the correct behavior for accounts that do not
+    have MFA enabled.
+
+    :param cli_otp: The value passed to --otp, or None.
+    :return: The OTP string, or None.
+    """
+    if cli_otp:
+        return cli_otp.strip()
+    env_otp = os.environ.get("PACER_OTP")
+    if env_otp:
+        return env_otp.strip()
+    if sys.stdin.isatty():
+        entered = input(
+            "PACER one-time passcode (press Enter to skip if MFA is off): "
+        )
+        return entered.strip() or None
+    return None
+
+
+def build_session(username, password, client_code, otp_code):
+    """Construct an MFA-capable PACER session and log in.
+
+    :param username: PACER username.
+    :param password: PACER password.
+    :param client_code: Optional PACER client code.
+    :param otp_code: Optional one-time passcode for MFA-enabled accounts.
+    :return: A logged-in ``MfaPacerSession``.
+    """
+    logger.info("Logging into PACER as '%s'", username)
+    if otp_code:
+        logger.info("Submitting a one-time passcode with the login request.")
+    session = MfaPacerSession(
+        username=username,
+        password=password,
+        client_code=client_code,
+        otp_code=otp_code,
+    )
+    session.login()
+    return session
 
 
 def get_pacer_case_id(session, court_id, docket_number):
@@ -264,6 +386,16 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--otp",
+        default=None,
+        help=(
+            "One-time passcode for MFA-enabled PACER accounts. If omitted and "
+            "the PACER_OTP env var is unset, you will be prompted for it right "
+            "before login (so the code is fresh). Leave the prompt blank if "
+            "your account does not use MFA."
+        ),
+    )
+    parser.add_argument(
         "--pacer-case-id",
         default=None,
         help=(
@@ -286,23 +418,28 @@ def main(argv=None):
     if args.verbose:
         logger.setLevel(logging.DEBUG)
 
-    if not args.username or not args.password:
+    if not args.username:
         sys.exit(
-            "PACER credentials are required. Set PACER_USERNAME and "
-            "PACER_PASSWORD, or pass --username/--password."
+            "A PACER username is required. Set PACER_USERNAME or pass "
+            "--username."
+        )
+
+    password = resolve_password(args.password)
+    if not password:
+        sys.exit(
+            "A PACER password is required. Set PACER_PASSWORD, pass "
+            "--password, or run interactively to be prompted."
         )
 
     os.makedirs(args.output_dir, exist_ok=True)
 
     # 1. Log into PACER. The session holds the auth cookies used by every
-    #    subsequent report request.
-    logger.info("Logging into PACER as '%s'", args.username)
-    session = PacerSession(
-        username=args.username,
-        password=args.password,
-        client_code=args.client_code,
+    #    subsequent report request. The OTP (if any) is acquired here, as late
+    #    as possible, so a rotating authenticator code is still valid at login.
+    otp_code = resolve_otp(args.otp)
+    session = build_session(
+        args.username, password, args.client_code, otp_code
     )
-    session.login()
 
     # 2. Resolve the docket number + court into the internal pacer_case_id.
     if args.pacer_case_id:
