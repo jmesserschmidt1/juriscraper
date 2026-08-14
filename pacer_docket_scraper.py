@@ -51,19 +51,32 @@ session cookie expires mid-run; for a single case it will not. If you hit a
 ``PacerLoginException`` partway through a long job, just re-run with a fresh
 code.
 
-Usage::
+The script runs in one of three modes, chosen by the options you pass:
 
-    export PACER_USERNAME=your_username
-    export PACER_PASSWORD=your_password
+* Live fetch (default) -- search PACER and download+parse both reports::
 
-    python pacer_docket_scraper.py \
-        --court cand \
-        --docket-number 4:06-cv-07294 \
-        --output-dir ./pacer_output
+      export PACER_USERNAME=your_username
+      export PACER_PASSWORD=your_password
+      python pacer_docket_scraper.py --court cand \
+          --docket-number 4:06-cv-07294 --output-dir ./pacer_output
 
-    # With MFA: you'll be prompted for the one-time passcode, or pass it in:
-    python pacer_docket_scraper.py --court cand \
-        --docket-number 4:06-cv-07294 --otp 123456
+      # With MFA: you'll be prompted for the one-time passcode, or pass it in:
+      python pacer_docket_scraper.py --court cand \
+          --docket-number 4:06-cv-07294 --otp 123456
+
+* Local parse -- turn already-downloaded HTML into JSON, no PACER login::
+
+      python pacer_docket_scraper.py --court nysd \
+          --docket-html ./nysd_1-25-cv-09596_dkt.html \
+          --history-html ./nysd_1-25-cv-09596_hist.html
+
+* Bulk CSV -- process many cases from a CSV with columns ``court``,
+  ``docket_number``, ``docket_html``, ``history_html``. A row with an html
+  path is parsed locally; a row with ``court`` + ``docket_number`` is fetched
+  from PACER (login happens once, on the first live row, so an all-local CSV
+  needs no credentials). A failing row is logged and skipped::
+
+      python pacer_docket_scraper.py --csv ./cases.csv --output-dir ./out
 
 Credentials may also be supplied with ``--username`` / ``--password``. When the
 password or OTP is omitted and the script is run interactively, it prompts for
@@ -75,6 +88,7 @@ point it at a case you actually intend to purchase.
 """
 
 import argparse
+import csv
 import datetime
 import getpass
 import json
@@ -94,6 +108,10 @@ from juriscraper.pacer.http import PacerSession
 from juriscraper.pacer.utils import get_pacer_doc_id_from_doc1_url
 
 logger = make_default_logger()
+
+
+class CaseNotFound(Exception):
+    """Raised when a docket number can't be resolved to a PACER case."""
 
 
 def _parse_attachments_from_cell(cell):
@@ -284,9 +302,15 @@ class AttachmentDocketReport(DocketReport):
             # This excludes the "Select all / clear" buttons, whose query is a
             # session id like "100591727900924-L_1_0-1".
             id_match = re.search(r"DktRpt\.pl\?(\d+)(?:[#&]|$)", href)
-            docket_number = clean_string(anchor.text_content())
-            if not id_match or not docket_number:
+            raw_number = clean_string(anchor.text_content())
+            if not id_match or not raw_number:
                 continue
+            # The link text carries the judge initials (e.g.
+            # "1:24-cv-04155-KPF"); keep just the docket number itself.
+            number_match = self.docket_number_dist_regex.search(raw_number)
+            docket_number = (
+                number_match.group(1) if number_match else raw_number
+            )
 
             tables_text = " ".join(
                 t.text_content() for t in anchor.xpath("./ancestor::table")
@@ -539,7 +563,7 @@ def get_pacer_case_id(session, court_id, docket_number):
     :param court_id: The Juriscraper court id, e.g. ``"cand"``.
     :param docket_number: A docket number string, e.g. ``"4:06-cv-07294"``.
     :return: The ``pacer_case_id`` string.
-    :raises SystemExit: if the case cannot be found.
+    :raises CaseNotFound: if the case cannot be found.
     """
     logger.info(
         "Looking up pacer_case_id for docket '%s' in court '%s'",
@@ -551,7 +575,7 @@ def get_pacer_case_id(session, court_id, docket_number):
     result = report.data(docket_number_letters=None)
 
     if not result:
-        sys.exit(
+        raise CaseNotFound(
             f"Could not find a case for docket '{docket_number}' in "
             f"court '{court_id}'. It may not exist or may be sealed."
         )
@@ -604,12 +628,112 @@ def parse_html_file(report_class, court_id, html_path):
     :param html_path: Path to the saved HTML file.
     :return: The parsed ``.data`` dict.
     """
-    with open(html_path, encoding="utf-8") as f:
-        html = f.read()
+    return _parse_report_data(
+        report_class, court_id, read_html_file(html_path)
+    )
 
+
+def read_html_file(path):
+    """Read a local HTML report file into text, tolerating common encodings.
+
+    PACER pages are variously served as UTF-8, Windows-1252, or Latin-1, so we
+    try each in turn; that way a report saved by any tool can still be parsed.
+
+    :param path: Path to the HTML file.
+    :return: The file's contents as a unicode string.
+    """
+    with open(path, "rb") as f:
+        raw = f.read()
+    for encoding in ("utf-8", "cp1252", "latin-1"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _parse_report_data(report_class, court_id, html_text):
+    """Parse report HTML text into a JSON-ready dict.
+
+    :param report_class: A report class such as ``AttachmentDocketReport``.
+    :param court_id: The Juriscraper court id the HTML came from.
+    :param html_text: The report HTML as a unicode string.
+    :return: The parsed ``.data`` dict.
+    """
     report = report_class(court_id)
-    report._parse_text(html)
+    report._parse_text(html_text)
     return report.data
+
+
+def process_docket_html(
+    court_id,
+    html_text,
+    output_dir,
+    fallback_docket_number=None,
+    save_source_html=False,
+):
+    """Parse docket-report HTML into JSON and save it (optionally the HTML too).
+
+    :param court_id: The Juriscraper court id the HTML came from.
+    :param html_text: The docket report HTML as a unicode string.
+    :param output_dir: Directory to write outputs to.
+    :param fallback_docket_number: Docket number to use in the filename if the
+    report itself doesn't yield one.
+    :param save_source_html: Whether to also write the source HTML next to the
+    JSON (used for live fetches; skipped when parsing an existing local file).
+    :return: The parsed docket data dict.
+    """
+    data = _parse_report_data(AttachmentDocketReport, court_id, html_text)
+    base = report_basename(
+        court_id, data.get("docket_number"), fallback_docket_number, "dkt"
+    )
+    if save_source_html:
+        save_html(html_text, os.path.join(output_dir, f"{base}.html"))
+    save_json(data, os.path.join(output_dir, f"{base}.json"))
+    logger.info(
+        "Docket report parsed: %s entries, %s parties, flags=%s, "
+        "%s member / %s related cases",
+        len(data.get("docket_entries", [])),
+        len(data.get("parties", [])),
+        data.get("flags", []),
+        len(data.get("member_cases", [])),
+        len(data.get("related_cases", [])),
+    )
+    return data
+
+
+def process_history_html(
+    court_id,
+    html_text,
+    output_dir,
+    fallback_docket_number=None,
+    save_source_html=False,
+):
+    """Parse docket-history HTML into JSON and save it (optionally the HTML too).
+
+    :param court_id: The Juriscraper court id the HTML came from.
+    :param html_text: The docket history report HTML as a unicode string.
+    :param output_dir: Directory to write outputs to.
+    :param fallback_docket_number: Docket number to use in the filename if the
+    report itself doesn't yield one.
+    :param save_source_html: Whether to also write the source HTML next to the
+    JSON (used for live fetches; skipped when parsing an existing local file).
+    :return: The parsed docket history data dict.
+    """
+    data = _parse_report_data(
+        TerminationDocketHistoryReport, court_id, html_text
+    )
+    base = report_basename(
+        court_id, data.get("docket_number"), fallback_docket_number, "hist"
+    )
+    if save_source_html:
+        save_html(html_text, os.path.join(output_dir, f"{base}.html"))
+    save_json(data, os.path.join(output_dir, f"{base}.json"))
+    logger.info(
+        "Docket history report parsed: %s entries",
+        len(data.get("docket_entries", [])),
+    )
+    return data
 
 
 def docket_number_slug(docket_number):
@@ -672,29 +796,15 @@ def scrape_docket(
         # more accurate than fetching a separate attachment page per document.
         show_multiple_docs=True,
     )
-
-    # Name files after the court and the report's own (normalized) docket
-    # number, e.g. nysd_1-25-cv-09596_dkt.{html,json}.
-    base = report_basename(
+    # Save the fetched HTML alongside the JSON (files are named after the
+    # court and the report's own docket number, e.g. nysd_1-25-cv-09596_dkt).
+    return process_docket_html(
         court_id,
-        report.metadata.get("docket_number"),
+        report.response.text,
+        output_dir,
         fallback_docket_number,
-        "dkt",
+        save_source_html=True,
     )
-    html_path = os.path.join(output_dir, f"{base}.html")
-    json_path = os.path.join(output_dir, f"{base}.json")
-
-    save_html(report.response.text, html_path)
-    # Parse from the saved HTML file to keep download and parse independent.
-    data = parse_html_file(AttachmentDocketReport, court_id, html_path)
-    save_json(data, json_path)
-
-    logger.info(
-        "Docket report parsed: %s docket entries, %s parties",
-        len(data.get("docket_entries", [])),
-        len(data.get("parties", [])),
-    )
-    return data
 
 
 def scrape_docket_history(
@@ -720,49 +830,70 @@ def scrape_docket_history(
         order_by="asc",
         show_de_descriptions=True,
     )
-
-    # Name files after the court and the report's own (normalized) docket
-    # number, e.g. nysd_1-25-cv-09596_hist.{html,json}.
-    base = report_basename(
+    return process_history_html(
         court_id,
-        report.metadata.get("docket_number"),
+        report.response.text,
+        output_dir,
         fallback_docket_number,
-        "hist",
+        save_source_html=True,
     )
-    html_path = os.path.join(output_dir, f"{base}.html")
-    json_path = os.path.join(output_dir, f"{base}.json")
-
-    save_html(report.response.text, html_path)
-    # Parse from the saved HTML file to keep download and parse independent.
-    data = parse_html_file(
-        TerminationDocketHistoryReport, court_id, html_path
-    )
-    save_json(data, json_path)
-
-    logger.info(
-        "Docket history report parsed: %s docket entries",
-        len(data.get("docket_entries", [])),
-    )
-    return data
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
             "Search PACER for a case by docket number and court, download the "
             "Docket Report and Docket History Report as HTML, and parse each "
             "into JSON."
-        )
+        ),
+        epilog=(
+            "Modes (chosen automatically by the options you pass):\n"
+            "  Live fetch (default): --court and --docket-number search PACER,\n"
+            "      download both reports, and parse them (requires login).\n"
+            "  Local parse: --docket-html and/or --history-html parse existing\n"
+            "      HTML files into JSON (no login). --court is still required.\n"
+            "  Bulk CSV: --csv processes many cases from a CSV with columns\n"
+            "      court, docket_number, docket_html, history_html. A row with\n"
+            "      an html path is parsed locally; a row with court+docket_number\n"
+            "      is fetched live (login happens once, on the first live row).\n"
+        ),
     )
     parser.add_argument(
         "--court",
-        required=True,
+        default=None,
         help="Juriscraper court id (e.g. 'cand', 'nysd', 'txsd').",
     )
     parser.add_argument(
         "--docket-number",
-        required=True,
+        default=None,
         help="Docket number to search for (e.g. '4:06-cv-07294').",
+    )
+    parser.add_argument(
+        "--docket-html",
+        default=None,
+        help=(
+            "Path to a local docket report HTML file to parse into JSON "
+            "(no PACER login). Requires --court."
+        ),
+    )
+    parser.add_argument(
+        "--history-html",
+        default=None,
+        help=(
+            "Path to a local docket history report HTML file to parse into "
+            "JSON (no PACER login). Requires --court."
+        ),
+    )
+    parser.add_argument(
+        "--csv",
+        default=None,
+        help=(
+            "Path to a CSV for bulk processing. Recognized columns: court, "
+            "docket_number, docket_html, history_html. Rows with an html path "
+            "are parsed locally; rows with court+docket_number are fetched "
+            "from PACER."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -814,61 +945,195 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
+def login_from_args(args):
+    """Resolve credentials from parsed args and log into PACER.
+
+    :param args: The parsed argparse namespace.
+    :return: A logged-in ``MfaPacerSession``.
+    :raises SystemExit: if a username or password can't be obtained.
+    """
+    if not args.username:
+        sys.exit(
+            "A PACER username is required for live fetches. Set PACER_USERNAME "
+            "or pass --username."
+        )
+    password = resolve_password(args.password)
+    if not password:
+        sys.exit(
+            "A PACER password is required for live fetches. Set PACER_PASSWORD, "
+            "pass --password, or run interactively to be prompted."
+        )
+    # Acquire the OTP (if any) as late as possible so a rotating authenticator
+    # code is still valid at login.
+    otp_code = resolve_otp(args.otp)
+    return build_session(args.username, password, args.client_code, otp_code)
+
+
+def fetch_case(session, court_id, pacer_case_id, docket_number, output_dir):
+    """Fetch, save, and parse both reports for one case from PACER.
+
+    :param session: A logged-in ``PacerSession``.
+    :param court_id: The Juriscraper court id.
+    :param pacer_case_id: The internal PACER case id.
+    :param docket_number: The docket number (used for filenames/logging).
+    :param output_dir: Directory to write outputs to.
+    :return: None
+    """
+    scrape_docket(
+        session, court_id, pacer_case_id, output_dir, docket_number
+    )
+    scrape_docket_history(
+        session, court_id, pacer_case_id, output_dir, docket_number
+    )
+
+
+def run_live(args):
+    """Live mode: search PACER for one case and process both reports."""
+    if not args.court:
+        sys.exit("--court is required for a live PACER fetch.")
+    if not (args.docket_number or args.pacer_case_id):
+        sys.exit(
+            "--docket-number (or --pacer-case-id) is required for a live "
+            "PACER fetch."
+        )
+
+    session = login_from_args(args)
+    if args.pacer_case_id:
+        pacer_case_id = args.pacer_case_id
+        logger.info("Using supplied pacer_case_id=%s", pacer_case_id)
+    else:
+        try:
+            pacer_case_id = get_pacer_case_id(
+                session, args.court, args.docket_number
+            )
+        except CaseNotFound as exc:
+            sys.exit(str(exc))
+    fetch_case(
+        session,
+        args.court,
+        pacer_case_id,
+        args.docket_number,
+        args.output_dir,
+    )
+
+
+def run_local(args):
+    """Local mode: parse existing HTML file(s) into JSON, no PACER login."""
+    if not args.court:
+        sys.exit(
+            "--court is required to parse local HTML (it drives doc-id "
+            "prefixes and the output filenames)."
+        )
+    if args.docket_html:
+        process_docket_html(
+            args.court,
+            read_html_file(args.docket_html),
+            args.output_dir,
+            args.docket_number,
+        )
+    if args.history_html:
+        process_history_html(
+            args.court,
+            read_html_file(args.history_html),
+            args.output_dir,
+            args.docket_number,
+        )
+
+
+def run_csv(args):
+    """Bulk mode: process each row of a CSV (local parse and/or live fetch).
+
+    Recognized columns (case-insensitive): ``court``, ``docket_number``,
+    ``docket_html``, ``history_html``. A row with an html path is parsed
+    locally; a row with ``court`` + ``docket_number`` is fetched from PACER.
+    Login happens lazily on the first live row, so a CSV of only local files
+    needs no credentials. A failing row is logged and skipped so one bad case
+    doesn't abort the whole run.
+    """
+    session = None  # Created lazily on the first row that needs PACER.
+    processed = 0
+    # utf-8-sig transparently strips a BOM if the CSV has one.
+    with open(args.csv, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            sys.exit(f"CSV '{args.csv}' appears to be empty.")
+        for line_number, raw_row in enumerate(reader, start=2):
+            row = {
+                (k or "").strip().lower(): (v or "").strip()
+                for k, v in raw_row.items()
+            }
+            court = row.get("court", "")
+            docket_number = row.get("docket_number", "")
+            docket_html = row.get("docket_html", "")
+            history_html = row.get("history_html", "")
+            try:
+                if docket_html or history_html:
+                    if not court:
+                        logger.warning(
+                            "Row %s: 'court' is required to parse local HTML; "
+                            "skipping.",
+                            line_number,
+                        )
+                        continue
+                    if docket_html:
+                        process_docket_html(
+                            court,
+                            read_html_file(docket_html),
+                            args.output_dir,
+                            docket_number or None,
+                        )
+                    if history_html:
+                        process_history_html(
+                            court,
+                            read_html_file(history_html),
+                            args.output_dir,
+                            docket_number or None,
+                        )
+                    processed += 1
+                elif court and docket_number:
+                    if session is None:
+                        session = login_from_args(args)
+                    pacer_case_id = get_pacer_case_id(
+                        session, court, docket_number
+                    )
+                    fetch_case(
+                        session,
+                        court,
+                        pacer_case_id,
+                        docket_number,
+                        args.output_dir,
+                    )
+                    processed += 1
+                else:
+                    logger.warning(
+                        "Row %s: need 'court'+'docket_number' (live) or a "
+                        "'docket_html'/'history_html' path; skipping.",
+                        line_number,
+                    )
+            except SystemExit:
+                # Missing credentials on the first live row is fatal.
+                raise
+            except Exception as exc:
+                logger.error("Row %s failed: %s", line_number, exc)
+    logger.info("CSV run complete: processed %s row(s).", processed)
+
+
 def main(argv=None):
     args = parse_args(argv)
 
     if args.verbose:
         logger.setLevel(logging.DEBUG)
 
-    if not args.username:
-        sys.exit(
-            "A PACER username is required. Set PACER_USERNAME or pass "
-            "--username."
-        )
-
-    password = resolve_password(args.password)
-    if not password:
-        sys.exit(
-            "A PACER password is required. Set PACER_PASSWORD, pass "
-            "--password, or run interactively to be prompted."
-        )
-
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # 1. Log into PACER. The session holds the auth cookies used by every
-    #    subsequent report request. The OTP (if any) is acquired here, as late
-    #    as possible, so a rotating authenticator code is still valid at login.
-    otp_code = resolve_otp(args.otp)
-    session = build_session(
-        args.username, password, args.client_code, otp_code
-    )
-
-    # 2. Resolve the docket number + court into the internal pacer_case_id.
-    if args.pacer_case_id:
-        pacer_case_id = args.pacer_case_id
-        logger.info("Using supplied pacer_case_id=%s", pacer_case_id)
+    # Pick the mode from the options provided: bulk CSV, local file(s), or a
+    # live single-case fetch (the default).
+    if args.csv:
+        run_csv(args)
+    elif args.docket_html or args.history_html:
+        run_local(args)
     else:
-        pacer_case_id = get_pacer_case_id(
-            session, args.court, args.docket_number
-        )
-
-    # 3. Docket Report -> HTML -> JSON.
-    scrape_docket(
-        session,
-        args.court,
-        pacer_case_id,
-        args.output_dir,
-        fallback_docket_number=args.docket_number,
-    )
-
-    # 4. Docket History Report -> HTML -> JSON.
-    scrape_docket_history(
-        session,
-        args.court,
-        pacer_case_id,
-        args.output_dir,
-        fallback_docket_number=args.docket_number,
-    )
+        run_live(args)
 
     logger.info("Done. Outputs written to %s", os.path.abspath(args.output_dir))
 
