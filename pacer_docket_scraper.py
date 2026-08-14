@@ -201,6 +201,40 @@ class AttachmentDocketReport(DocketReport):
     one.
     """
 
+    def query(self, *args, show_all_attachments=True, **kwargs):
+        """Query the docket report, also requesting "view all attachments".
+
+        Juriscraper's ``DocketReport.query`` can enable "view multiple
+        documents" (``show_multiple_docs``) but has no flag for its "view all
+        attachments" sub-option. That sub-option's form field is
+        ``view_all_attachments=on`` (confirmed from PACER's docket report query
+        page), and it is what makes PACER render the per-entry structured
+        attachment tables -- with ``view_multi_docs=on`` alone you get the
+        multi-select checkboxes but no attachment rows. We add that field by
+        briefly wrapping the session's ``post`` so it rides along with the
+        request the parent builds, and only when "view multiple documents" is
+        actually enabled (the field has no effect otherwise, and PACER warns it
+        may add cost).
+
+        :param show_all_attachments: Whether to also send
+        ``view_all_attachments=on`` alongside a multi-document request.
+        """
+        if not show_all_attachments:
+            return super().query(*args, **kwargs)
+
+        original_post = self.session.post
+
+        def post_with_all_attachments(url, data=None, **post_kwargs):
+            if isinstance(data, dict) and data.get("view_multi_docs") == "on":
+                data = {**data, "view_all_attachments": "on"}
+            return original_post(url, data=data, **post_kwargs)
+
+        self.session.post = post_with_all_attachments
+        try:
+            return super().query(*args, **kwargs)
+        finally:
+            self.session.post = original_post
+
     @property
     def docket_entries(self):
         entries = super().docket_entries
@@ -510,10 +544,12 @@ def scrape_docket(session, court_id, pacer_case_id, output_dir):
         show_parties_and_counsel=True,
         show_terminated_parties=True,
         show_list_of_member_cases=True,
-        # Request the "view multiple documents" report so PACER renders a
+        # Request the "view multiple documents" report; AttachmentDocketReport
+        # also sends its "view all attachments" sub-option
+        # (view_all_attachments=on), which is what makes PACER render a
         # structured attachment table (with page counts and file sizes) for
-        # each entry, in a single billable request -- more efficient and more
-        # accurate than fetching a separate attachment page per document.
+        # each entry -- all in a single billable request, more efficient and
+        # more accurate than fetching a separate attachment page per document.
         show_multiple_docs=True,
     )
 
