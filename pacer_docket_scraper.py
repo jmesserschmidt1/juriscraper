@@ -13,12 +13,17 @@ library. It ties together the pieces Juriscraper already provides:
                                   docket entries).
   4. ``DocketHistoryReport``   -- the lighter "history/documents" report.
 
-Two small subclasses extend the stock parsers where they drop data this script
-wants: ``AttachmentDocketReport`` adds the inline ``(Attachments: ...)`` links
-to each docket entry that has them, and ``TerminationDocketHistoryReport`` adds
-the per-entry ``Terminated:`` date that the history report shows on some
-motions. Both only add keys -- all of Juriscraper's existing parsed output is
-preserved untouched.
+The docket report is requested with "view multiple documents" enabled, so
+PACER returns a structured attachment table (with page counts and file sizes)
+for every entry in a single billable request -- more efficient and more
+accurate than fetching a separate attachment page per document. Two small
+subclasses extend the stock parsers where they still drop data this script
+wants: ``AttachmentDocketReport`` keeps Juriscraper's rich structured
+attachments and, for a plain report that lacks them, falls back to the inline
+``(Attachments: ...)`` links; ``TerminationDocketHistoryReport`` adds the
+per-entry ``Terminated:`` date the history report shows on some motions. Both
+only add keys -- all of Juriscraper's existing parsed output is preserved
+untouched.
 
 For each report we download the raw HTML exactly as PACER served it, write it
 to disk, and then parse that saved HTML into a JSON document. Parsing is done
@@ -172,22 +177,41 @@ def _parse_attachments_from_cell(cell):
 
 
 class AttachmentDocketReport(DocketReport):
-    """A ``DocketReport`` that also captures each entry's inline attachments.
+    """A ``DocketReport`` that reliably captures each entry's attachments.
 
-    A normal (non "view multiple documents") docket report lists a docket
-    entry's attachments inline in the docket text, where each ``# N`` is a link
-    to the attachment's PDF. Juriscraper's stock ``DocketReport`` only pulls
-    structured attachment rows from the separate "view multiple documents"
-    table, so those inline attachments never reach ``.data``. This subclass
-    reuses all of the parent parsing and adds an ``attachments`` list to each
-    entry that has one, matched by the entry's main ``pacer_doc_id``.
+    A docket entry's attachments can reach us two ways:
+
+    * When the report is pulled with "view multiple documents" *and* "view all
+      attachments" enabled (see ``scrape_docket``), PACER renders a structured
+      attachment table per entry, and Juriscraper's stock ``DocketReport``
+      already parses it into a rich ``attachments`` list -- attachment number,
+      description, ``pacer_doc_id``, ``page_count``, ``file_size_str``, and
+      ``file_size_bytes`` -- and also merges the main document's page count and
+      size onto the entry itself. This is the preferred, most accurate source.
+
+    * A plain docket report only lists attachments inline in the docket text
+      (``(Attachments: # 1 Exhibit A, # 2 Exhibit B)``), which the stock parser
+      ignores. For those entries this subclass falls back to parsing the inline
+      links, yielding attachment number, ``pacer_doc_id``, and description (no
+      page counts or sizes -- that data simply isn't present in that view).
+
+    The structured table is preferred whenever present; the inline fallback
+    only fills entries the stock parser left without attachments, so requesting
+    the richer report is a strict upgrade and this class still works on a plain
+    one.
     """
 
     @property
     def docket_entries(self):
         entries = super().docket_entries
+        # Only fall back to inline parsing for entries the stock parser did not
+        # already populate from a structured "view multiple documents" table.
+        if any(de.get("attachments") for de in entries):
+            return entries
         attachments_by_doc_id = self._parse_inline_attachments()
         for de in entries:
+            if de.get("attachments"):
+                continue
             attachments = attachments_by_doc_id.get(de.get("pacer_doc_id"))
             if attachments:
                 de["attachments"] = attachments
@@ -197,7 +221,7 @@ class AttachmentDocketReport(DocketReport):
         """Map each entry's main pacer_doc_id to its inline attachments.
 
         :return: ``{pacer_doc_id: [attachment, ...]}`` for entries that have
-        attachments.
+        inline attachment links.
         """
         result = {}
         for row in self._get_docket_entry_rows()[1:]:  # Skip the header row.
@@ -486,6 +510,11 @@ def scrape_docket(session, court_id, pacer_case_id, output_dir):
         show_parties_and_counsel=True,
         show_terminated_parties=True,
         show_list_of_member_cases=True,
+        # Request the "view multiple documents" report so PACER renders a
+        # structured attachment table (with page counts and file sizes) for
+        # each entry, in a single billable request -- more efficient and more
+        # accurate than fetching a separate attachment page per document.
+        show_multiple_docs=True,
     )
 
     html_path = os.path.join(output_dir, "docket_report.html")
