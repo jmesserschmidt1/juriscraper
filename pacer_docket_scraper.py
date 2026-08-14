@@ -528,13 +528,49 @@ def parse_html_file(report_class, court_id, html_path):
     return report.data
 
 
-def scrape_docket(session, court_id, pacer_case_id, output_dir):
+def docket_number_slug(docket_number):
+    """Turn a docket number into a filename-safe slug.
+
+    PACER docket numbers put a colon after the office number
+    (``1:25-cv-09596``); we render that as all hyphens so the value is both
+    safe and readable in a filename: ``1-25-cv-09596``.
+
+    :param docket_number: A docket number string.
+    :return: A filename-safe slug.
+    """
+    slug = re.sub(r"[\s:/]+", "-", docket_number.strip())
+    # Drop anything else that isn't filename-safe.
+    return re.sub(r"[^A-Za-z0-9._-]", "", slug)
+
+
+def report_basename(court_id, docket_number, fallback_docket_number, suffix):
+    """Build an output basename like ``nysd_1-25-cv-09596_dkt``.
+
+    :param court_id: The Juriscraper court id.
+    :param docket_number: The docket number parsed from the report (preferred,
+    since it is normalized), or None/empty.
+    :param fallback_docket_number: The docket number to use if the report did
+    not yield one (e.g. the value the user searched for).
+    :param suffix: A short tag for the report type: ``"dkt"`` or ``"hist"``.
+    :return: The basename, without directory or extension.
+    """
+    docket_number = docket_number or fallback_docket_number
+    if docket_number:
+        return f"{court_id}_{docket_number_slug(docket_number)}_{suffix}"
+    return f"{court_id}_{suffix}"
+
+
+def scrape_docket(
+    session, court_id, pacer_case_id, output_dir, fallback_docket_number=None
+):
     """Fetch, save, and parse the full Docket Report.
 
     :param session: A logged-in ``PacerSession``.
     :param court_id: The Juriscraper court id.
     :param pacer_case_id: The internal PACER case id.
     :param output_dir: Directory to write outputs to.
+    :param fallback_docket_number: Docket number to use in the filename if the
+    report itself doesn't yield one (e.g. the value the user searched for).
     :return: The parsed docket data dict.
     """
     logger.info("Fetching docket report for pacer_case_id=%s", pacer_case_id)
@@ -553,8 +589,16 @@ def scrape_docket(session, court_id, pacer_case_id, output_dir):
         show_multiple_docs=True,
     )
 
-    html_path = os.path.join(output_dir, "docket_report.html")
-    json_path = os.path.join(output_dir, "docket_report.json")
+    # Name files after the court and the report's own (normalized) docket
+    # number, e.g. nysd_1-25-cv-09596_dkt.{html,json}.
+    base = report_basename(
+        court_id,
+        report.metadata.get("docket_number"),
+        fallback_docket_number,
+        "dkt",
+    )
+    html_path = os.path.join(output_dir, f"{base}.html")
+    json_path = os.path.join(output_dir, f"{base}.json")
 
     save_html(report.response.text, html_path)
     # Parse from the saved HTML file to keep download and parse independent.
@@ -569,13 +613,17 @@ def scrape_docket(session, court_id, pacer_case_id, output_dir):
     return data
 
 
-def scrape_docket_history(session, court_id, pacer_case_id, output_dir):
+def scrape_docket_history(
+    session, court_id, pacer_case_id, output_dir, fallback_docket_number=None
+):
     """Fetch, save, and parse the Docket History Report.
 
     :param session: A logged-in ``PacerSession``.
     :param court_id: The Juriscraper court id.
     :param pacer_case_id: The internal PACER case id.
     :param output_dir: Directory to write outputs to.
+    :param fallback_docket_number: Docket number to use in the filename if the
+    report itself doesn't yield one (e.g. the value the user searched for).
     :return: The parsed docket history data dict.
     """
     logger.info(
@@ -589,8 +637,16 @@ def scrape_docket_history(session, court_id, pacer_case_id, output_dir):
         show_de_descriptions=True,
     )
 
-    html_path = os.path.join(output_dir, "docket_history_report.html")
-    json_path = os.path.join(output_dir, "docket_history_report.json")
+    # Name files after the court and the report's own (normalized) docket
+    # number, e.g. nysd_1-25-cv-09596_hist.{html,json}.
+    base = report_basename(
+        court_id,
+        report.metadata.get("docket_number"),
+        fallback_docket_number,
+        "hist",
+    )
+    html_path = os.path.join(output_dir, f"{base}.html")
+    json_path = os.path.join(output_dir, f"{base}.json")
 
     save_html(report.response.text, html_path)
     # Parse from the saved HTML file to keep download and parse independent.
@@ -713,10 +769,22 @@ def main(argv=None):
         )
 
     # 3. Docket Report -> HTML -> JSON.
-    scrape_docket(session, args.court, pacer_case_id, args.output_dir)
+    scrape_docket(
+        session,
+        args.court,
+        pacer_case_id,
+        args.output_dir,
+        fallback_docket_number=args.docket_number,
+    )
 
     # 4. Docket History Report -> HTML -> JSON.
-    scrape_docket_history(session, args.court, pacer_case_id, args.output_dir)
+    scrape_docket_history(
+        session,
+        args.court,
+        pacer_case_id,
+        args.output_dir,
+        fallback_docket_number=args.docket_number,
+    )
 
     logger.info("Done. Outputs written to %s", os.path.abspath(args.output_dir))
 
