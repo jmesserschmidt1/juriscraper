@@ -13,6 +13,13 @@ library. It ties together the pieces Juriscraper already provides:
                                   docket entries).
   4. ``DocketHistoryReport``   -- the lighter "history/documents" report.
 
+Two small subclasses extend the stock parsers where they drop data this script
+wants: ``AttachmentDocketReport`` adds the inline ``(Attachments: ...)`` links
+to each docket entry that has them, and ``TerminationDocketHistoryReport`` adds
+the per-entry ``Terminated:`` date that the history report shows on some
+motions. Both only add keys -- all of Juriscraper's existing parsed output is
+preserved untouched.
+
 For each report we download the raw HTML exactly as PACER served it, write it
 to disk, and then parse that saved HTML into a JSON document. Parsing is done
 from the file on disk (not the in-memory response) to demonstrate that the
@@ -66,17 +73,205 @@ import getpass
 import json
 import logging
 import os
+import re
 import sys
 
 from juriscraper.lib.log_tools import make_default_logger
+from juriscraper.lib.string_utils import clean_string, convert_date_string
 from juriscraper.pacer import (
     DocketHistoryReport,
     DocketReport,
     PossibleCaseNumberApi,
 )
 from juriscraper.pacer.http import PacerSession
+from juriscraper.pacer.utils import get_pacer_doc_id_from_doc1_url
 
 logger = make_default_logger()
+
+
+def _parse_attachments_from_cell(cell):
+    """Parse a docket entry's inline "(Attachments: ...)" links from its cell.
+
+    A docket-text cell can carry both cross-reference links (``re: 10
+    MOTION...``) and an attachment list (``(Attachments: # 1 Exhibit A, # 2
+    Exhibit B)``). Only the anchors inside the ``(Attachments:`` parenthetical
+    are attachments. We flatten the cell into a string with each anchor replaced
+    by a placeholder (so its href survives), isolate the ``(Attachments: ... )``
+    region by balanced-parenthesis matching -- descriptions themselves can
+    contain parentheses, e.g. "Good Standing (Florida, Georgia, Texas)" -- and
+    read each ``# N Description`` item out of it.
+
+    :param cell: The lxml ``<td>`` element holding the docket text.
+    :return: A list of dicts with ``attachment_number``, ``pacer_doc_id``, and
+    ``description`` keys, in document order. Empty if the entry has none.
+    """
+    # Flatten the cell into text, replacing each anchor with a placeholder
+    # token (\x00<index>\x00) so we can recover its href/label afterwards.
+    anchors = []
+    parts = []
+
+    def append_node_text(node):
+        parts.append(node.text_content())
+
+    if cell.text:
+        parts.append(cell.text)
+    for child in cell.iterchildren():
+        if not isinstance(child.tag, str):
+            # Comment / processing-instruction node (e.g. <!--SB-->): no anchor,
+            # but keep any trailing text that belongs to the docket text.
+            pass
+        elif child.tag == "a":
+            parts.append(f"\x00{len(anchors)}\x00")
+            anchors.append((child.get("href", ""), child.text_content()))
+        else:
+            append_node_text(child)
+        if child.tail:
+            parts.append(child.tail)
+    flat = "".join(parts)
+
+    start = flat.find("(Attachments")
+    if start == -1:
+        return []
+
+    # Walk from the opening paren, tracking depth, to find its match. Anchor
+    # placeholders contain no parens, so they don't affect the balance.
+    depth = 0
+    end = None
+    for i in range(start, len(flat)):
+        if flat[i] == "(":
+            depth += 1
+        elif flat[i] == ")":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    # Inner text between "(Attachments:" and the matching ")".
+    inner = flat[flat.index(":", start) + 1 : end if end is not None else None]
+
+    attachments = []
+    # Each item is "# <placeholder> description", up to the next ", #" item.
+    item_re = re.compile(
+        r"\x00(\d+)\x00\s*(.*?)(?=,\s*#\s*\x00\d+\x00|$)", re.DOTALL
+    )
+    for match in item_re.finditer(inner):
+        href, anchor_text = anchors[int(match.group(1))]
+        pacer_doc_id = (
+            get_pacer_doc_id_from_doc1_url(href) if "/doc1/" in href else None
+        )
+        number = anchor_text.strip()
+        attachments.append(
+            {
+                "attachment_number": (
+                    int(number) if number.isdigit() else number
+                ),
+                "pacer_doc_id": pacer_doc_id,
+                "description": clean_string(match.group(2)),
+            }
+        )
+    return attachments
+
+
+class AttachmentDocketReport(DocketReport):
+    """A ``DocketReport`` that also captures each entry's inline attachments.
+
+    A normal (non "view multiple documents") docket report lists a docket
+    entry's attachments inline in the docket text, where each ``# N`` is a link
+    to the attachment's PDF. Juriscraper's stock ``DocketReport`` only pulls
+    structured attachment rows from the separate "view multiple documents"
+    table, so those inline attachments never reach ``.data``. This subclass
+    reuses all of the parent parsing and adds an ``attachments`` list to each
+    entry that has one, matched by the entry's main ``pacer_doc_id``.
+    """
+
+    @property
+    def docket_entries(self):
+        entries = super().docket_entries
+        attachments_by_doc_id = self._parse_inline_attachments()
+        for de in entries:
+            attachments = attachments_by_doc_id.get(de.get("pacer_doc_id"))
+            if attachments:
+                de["attachments"] = attachments
+        return entries
+
+    def _parse_inline_attachments(self):
+        """Map each entry's main pacer_doc_id to its inline attachments.
+
+        :return: ``{pacer_doc_id: [attachment, ...]}`` for entries that have
+        attachments.
+        """
+        result = {}
+        for row in self._get_docket_entry_rows()[1:]:  # Skip the header row.
+            doc_anchors = row.xpath(".//a[contains(@href, '/doc1/')]")
+            if not doc_anchors:
+                continue
+            # The first doc1 link in the row is the entry's own document (the
+            # "#" column); it precedes any attachment links in the text cell.
+            main_doc_id = get_pacer_doc_id_from_doc1_url(
+                doc_anchors[0].xpath("./@href")[0]
+            )
+            desc_cells = [
+                td
+                for td in row.xpath("./td")
+                if "Attachments:" in td.text_content()
+            ]
+            if not desc_cells:
+                continue
+            attachments = _parse_attachments_from_cell(desc_cells[0])
+            if attachments:
+                result[main_doc_id] = attachments
+        return result
+
+
+class TerminationDocketHistoryReport(DocketHistoryReport):
+    """A ``DocketHistoryReport`` that also captures per-entry termination dates.
+
+    In a docket history report the "Dates" column can carry a ``Terminated:``
+    date alongside ``Filed`` / ``Entered`` (typically on motions later resolved,
+    e.g. lead-plaintiff or pro hac vice motions). Juriscraper's stock parser
+    reads only the filed and entered dates, so this subclass adds a
+    ``date_terminated`` field to every docket entry (``None`` when the entry has
+    no termination date), matched by the entry's document number.
+    """
+
+    @property
+    def docket_entries(self):
+        entries = super().docket_entries
+        terminated_by_number = self._parse_terminated_dates()
+        for de in entries:
+            de["date_terminated"] = terminated_by_number.get(
+                de.get("document_number")
+            )
+        return entries
+
+    def _parse_terminated_dates(self):
+        """Map document_number -> terminated date for entries that have one.
+
+        :return: ``{document_number: date}`` for entries with a Terminated date.
+        """
+        result = {}
+        docket_header = './/th/text()[contains(., "Description")]'
+        rows = self.tree.xpath(f"//table[{docket_header}]/tbody/tr")[1:]
+        for row in rows:
+            cells = row.xpath("./td")
+            if len(cells) != 3:
+                # Only the entry's first (3-cell) row holds the number + dates;
+                # the second row is the wrapped "Docket Text".
+                continue
+            document_number = clean_string(cells[0].text_content())
+            if not document_number:
+                continue
+            terminated = self._get_date_terminated(cells[1])
+            if terminated:
+                result[document_number] = terminated
+        return result
+
+    def _get_date_terminated(self, cell):
+        """Extract a ``Terminated:`` date from a "Dates" cell, or None."""
+        s = clean_string(cell.text_content())
+        match = self.date_terminated_regex.search(s)
+        if match:
+            return convert_date_string(match.group(1))
+        return None
 
 
 class MfaPacerSession(PacerSession):
@@ -285,7 +480,7 @@ def scrape_docket(session, court_id, pacer_case_id, output_dir):
     :return: The parsed docket data dict.
     """
     logger.info("Fetching docket report for pacer_case_id=%s", pacer_case_id)
-    report = DocketReport(court_id, session)
+    report = AttachmentDocketReport(court_id, session)
     report.query(
         pacer_case_id,
         show_parties_and_counsel=True,
@@ -298,7 +493,7 @@ def scrape_docket(session, court_id, pacer_case_id, output_dir):
 
     save_html(report.response.text, html_path)
     # Parse from the saved HTML file to keep download and parse independent.
-    data = parse_html_file(DocketReport, court_id, html_path)
+    data = parse_html_file(AttachmentDocketReport, court_id, html_path)
     save_json(data, json_path)
 
     logger.info(
@@ -321,7 +516,7 @@ def scrape_docket_history(session, court_id, pacer_case_id, output_dir):
     logger.info(
         "Fetching docket history report for pacer_case_id=%s", pacer_case_id
     )
-    report = DocketHistoryReport(court_id, session)
+    report = TerminationDocketHistoryReport(court_id, session)
     report.query(
         pacer_case_id,
         query_type="History",
@@ -334,7 +529,9 @@ def scrape_docket_history(session, court_id, pacer_case_id, output_dir):
 
     save_html(report.response.text, html_path)
     # Parse from the saved HTML file to keep download and parse independent.
-    data = parse_html_file(DocketHistoryReport, court_id, html_path)
+    data = parse_html_file(
+        TerminationDocketHistoryReport, court_id, html_path
+    )
     save_json(data, json_path)
 
     logger.info(
