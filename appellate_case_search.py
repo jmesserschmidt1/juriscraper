@@ -2,49 +2,42 @@
 """Find the appellate case that corresponds to a district-court case.
 
 Given an *originating* (district court) case number, this searches the relevant
-U.S. Court of Appeals on PACER and returns the matching appellate case(s) --
-appellate docket number, case name, and (when confirmed) the originating court
-information read back from the appellate docket.
+U.S. Court of Appeals on PACER and returns the matching appellate case(s). The
+appellate Case Search's own results already carry the originating case number
+and a direct link to the district docket, so each result also reports the
+district court and case number it came from -- i.e. "the corresponding case in
+the district court."
 
 It builds on the same Juriscraper PACER stack as ``pacer_docket_scraper.py`` and
-reuses that script's login (including MFA). Two pieces are solid and Juriscraper
--backed:
+reuses that script's login (including MFA). The mechanism was confirmed against
+Second Circuit (ca2) Case Search pages:
 
-  * the district -> circuit mapping (which appellate court to search), and
-  * the "confirm" step, which fetches the appellate docket with Juriscraper's
-    ``AppellateDocketReport`` (``incOrigDkt=Y``) and reads its "Originating
-    Court Information" -- the district court and case number the appeal came
-    from -- so a search hit can be verified against the number you searched for.
-
-The one best-effort piece is the live appellate *case search* request itself.
-Juriscraper does not implement an appellate search-by-originating-number, and
-the classic appellate CM/ECF search endpoint is not publicly documented, so the
-request in ``AppellateCaseSearch.query`` is a best-effort reconstruction that
-may need a tweak for a given circuit's CM/ECF version. To keep things reliable
-in the meantime, you can also run the court's Case Search in a browser, save the
-results page, and parse it here with ``--search-html`` -- the parsing and the
-confirm step do not depend on the live request.
+  * Search: a request to the court's ``TransportRoom`` endpoint with
+    ``servlet=CaseSelectionTable.jsp`` and ``origCase=<originating number>``
+    (the "Originating Case Number" field on the advanced Case Search form).
+  * Results: the "Case Selection Table" lists each matching appellate case with
+    its number, title, opening date, and -- crucially -- the originating case
+    number linked back to the district court's docket report.
 
 Usage::
 
     # Live: derive the circuit from the district and search it.
-    python appellate_case_search.py --district-court nhd \
-        --originating-case-number 1:19-cv-00143
+    python appellate_case_search.py --district-court nysd \
+        --originating-case-number 17-cv-1545
 
     # Live: name the appellate court explicitly instead of deriving it.
-    python appellate_case_search.py --appellate-court ca1 \
-        --originating-case-number 1:19-cv-00143
+    python appellate_case_search.py --appellate-court ca2 \
+        --originating-case-number 17-cv-1545
 
-    # Offline: parse a saved appellate Case Search results page.
-    python appellate_case_search.py --appellate-court ca1 \
-        --originating-case-number 1:19-cv-00143 \
-        --search-html ./ca1_search_results.html
+    # Offline: parse a saved Case Selection Table (no login needed).
+    python appellate_case_search.py --appellate-court ca2 \
+        --originating-case-number 17-cv-1545 \
+        --search-html ./case_selection_page_ca2.html
 
 Credentials come from PACER_USERNAME / PACER_PASSWORD (or --username /
 --password), with the same MFA handling as pacer_docket_scraper.py.
 
-NOTE: PACER is a paid service; live searches and docket confirmations incur
-charges.
+NOTE: PACER is a paid service; live searches incur charges.
 """
 
 import argparse
@@ -54,8 +47,8 @@ import re
 import sys
 from urllib.parse import parse_qs, urlparse
 
+from juriscraper.lib.html_utils import get_html_parsed_text
 from juriscraper.lib.string_utils import clean_string
-from juriscraper.pacer import AppellateDocketReport
 from juriscraper.pacer.reports import BaseReport
 
 # Reuse the login, credential, and IO helpers from the district script so the
@@ -116,15 +109,12 @@ SPECIAL_DISTRICT_TO_APPELLATE = {
 
 APPELLATE_COURTS = set(STATE_TO_APPELLATE.values()) | {"cafc"}
 
-# Appellate docket numbers look like "19-2244".
-APPELLATE_DOCKET_RE = re.compile(r"\b(\d\d-\d{3,5})\b")
-
 
 def appellate_court_for_district(district_court_id):
     """Return the appellate court id that hears appeals from a district court.
 
-    :param district_court_id: A Juriscraper district court id, e.g. ``"nhd"``.
-    :return: An appellate court id, e.g. ``"ca1"``.
+    :param district_court_id: A Juriscraper district court id, e.g. ``"nysd"``.
+    :return: An appellate court id, e.g. ``"ca2"``.
     :raises ValueError: if the circuit can't be determined.
     """
     court = district_court_id.strip().lower()
@@ -140,14 +130,42 @@ def appellate_court_for_district(district_court_id):
     )
 
 
-class AppellateCaseSearch(BaseReport):
-    """Search an appellate court's PACER site by originating case number.
+def normalize_originating_number(docket_number):
+    """Reduce a district case number to the short form the appellate court uses.
 
-    Reliability note: the live request in ``query`` is a best-effort
-    reconstruction of the appellate CM/ECF "Case Search" (Juriscraper has no
-    such report, and the endpoint isn't publicly documented). ``parse`` /
-    ``data`` -- the results parsing -- are independent of it and can be run
-    against a saved results page via ``_parse_text``.
+    The appellate "Originating Case Number" is stored without the office prefix
+    and without leading zeros, e.g. a district ``1:17-cv-01545`` is recorded and
+    searched as ``17-cv-1545``. Normalizing both sides lets us build the search
+    key and compare results regardless of how the number was typed.
+
+    :param docket_number: A district docket number in any common form.
+    :return: The normalized short form (e.g. ``"17-cv-1545"``), or the cleaned
+    input if it doesn't look like a district docket number.
+    """
+    s = clean_string(docket_number or "").lower().replace("\xa0", " ")
+    # Drop a leading office number ("1:").
+    s = re.sub(r"^\s*\d+\s*:\s*", "", s)
+    m = re.search(r"(\d+)-([a-z]+)-(\d+)", s)
+    if m:
+        return f"{int(m.group(1))}-{m.group(2)}-{int(m.group(3))}"
+    return s
+
+
+def court_id_from_ecf_url(url):
+    """Extract the Juriscraper court id from an ``ecf.<court>.uscourts.gov`` URL.
+
+    :param url: A PACER URL.
+    :return: The court id (e.g. ``"nysd"``), or ``""`` if not found.
+    """
+    match = re.search(r"ecf\.([^.]+)\.uscourts\.gov", url or "")
+    return match.group(1) if match else ""
+
+
+class AppellateCaseSearch(BaseReport):
+    """Search an appellate court's PACER Case Search by originating case number.
+
+    ``query`` performs the live search; ``_parse_text`` / ``data`` parse the
+    resulting "Case Selection Table" and work equally on a saved page.
     """
 
     @property
@@ -167,192 +185,201 @@ class AppellateCaseSearch(BaseReport):
             "n/beam/servlet/TransportRoom"
         )
 
+    def _get_csrf(self):
+        """Fetch the Case Search form and pull its CSRF token (best effort)."""
+        try:
+            r = self.session.get(
+                self.url, params={"servlet": "CaseSearch.jsp"}
+            )
+            tree = get_html_parsed_text(r.content)
+            values = tree.xpath('//input[@name="CSRF"]/@value')
+            if values:
+                return values[0]
+        except Exception as exc:  # noqa: BLE001 - CSRF is optional; log & go on
+            logger.debug("Could not obtain a CSRF token: %s", exc)
+        return ""
+
     def query(self, originating_case_number):
         """Search the appellate court for cases from an originating case number.
 
-        Best-effort: posts the originating case number to the court's Case
-        Search servlet. If a circuit's CM/ECF rejects this or returns no
-        parsable rows, fall back to saving the browser results page and parsing
-        it with ``_parse_text`` (the ``--search-html`` mode).
+        Submits the "Originating Case Number" (``origCase``) search to the
+        court's ``CaseSelectionTable.jsp`` servlet, mirroring the fields the
+        advanced Case Search form sends.
 
-        :param originating_case_number: The district court case number, e.g.
-        ``"1:19-cv-00143"``.
+        :param originating_case_number: The district case number, in any common
+        form (it's normalized to the appellate short form for the search).
         :return: None; sets ``self.response`` and runs ``self.parse()``.
         """
         assert self.session is not None, (
             "session attribute of AppellateCaseSearch cannot be None."
         )
+        orig_case = normalize_originating_number(originating_case_number)
         params = {
-            "servlet": "CaseSearch.jsp",
-            # The originating (lower court) case number to search by. Field
-            # name is a best-effort reconstruction; adjust if your circuit
-            # names it differently.
-            "origCaseNumber": originating_case_number,
-            "caseNumber": originating_case_number,
+            "servlet": "CaseSelectionTable.jsp",
+            "origCase": orig_case,
+            "searchPty": "pty",
+            "open_closed": "both",
+            "sortby": "casenumber",
+            "sortbyorder": "asc",
+            # The form also submits these empty; include them for fidelity.
+            "csnum1": "",
+            "csnum2": "",
+            "aName": "",
+            "filedate_begin": "",
+            "filedate_end": "",
+            "closedate_begin": "",
+            "closedate_end": "",
+            "lastdate_begin": "",
+            "lastdate_end": "",
         }
+        csrf = self._get_csrf()
+        if csrf:
+            params["CSRF"] = csrf
+
         logger.info(
-            "Searching %s for originating case '%s' (params=%s)",
+            "Searching %s Case Search for originating case '%s'.",
             self.court_id,
-            originating_case_number,
-            params,
+            orig_case,
         )
         self.response = self.session.get(self.url, params=params)
         self.parse()
 
     @property
     def data(self):
-        """Return the matching appellate cases parsed from the results page.
+        """Parse the Case Selection Table into a list of appellate cases.
 
-        :return: A list of dicts with ``appellate_docket_number``,
-        ``case_name``, ``pacer_case_id`` (when present), and ``url``.
+        Each result is anchored on its "Case Summary" link (the appellate case
+        number); the rest of the row supplies the title, dates, and originating
+        case. Returns a list of dicts with keys: ``appellate_docket_number``,
+        ``case_name``, ``pacer_case_id``, ``appellate_url``, ``opening_date``,
+        ``last_docket_entry``, ``originating_case_number``,
+        ``originating_court_id``, ``origin``, ``origin_code``, and
+        ``originating_docket_url``.
         """
         if self.tree is None:
             return []
 
         results = []
         seen = set()
-        # Appellate Case Search results link each hit to its CaseSummary.
-        anchors = self.tree.xpath(
-            '//a[contains(@href, "CaseSummary.jsp") '
-            'or contains(@href, "caseNum=") '
-            'or contains(@href, "caseid=") '
-            'or contains(@href, "caseId=")]'
-        )
-        for anchor in anchors:
-            href = anchor.get("href", "")
-            query = parse_qs(urlparse(href).query)
-
-            docket_number = (query.get("caseNum") or [""])[0].strip()
-            if not docket_number:
-                text_match = APPELLATE_DOCKET_RE.search(anchor.text_content())
-                if text_match:
-                    docket_number = text_match.group(1)
-            if not docket_number:
+        for summary in self.tree.xpath(
+            '//a[contains(@href, "CaseSummary.jsp")]'
+        ):
+            rows = summary.xpath("./ancestor::tr[1]")
+            if not rows:
+                continue
+            cells = rows[0].xpath("./td")
+            if len(cells) < 4:
                 continue
 
-            pacer_case_id = (
-                query.get("caseid")
-                or query.get("caseId")
-                or [None]
-            )[0]
+            summary_q = parse_qs(urlparse(summary.get("href", "")).query)
+            appellate_docket_number = (summary_q.get("caseNum") or [""])[0]
+            if not appellate_docket_number:
+                appellate_docket_number = clean_string(summary.text_content())
+            if appellate_docket_number in seen:
+                continue
+            seen.add(appellate_docket_number)
 
-            # Prefer the enclosing row's text as the case name; fall back to
-            # the text right after the link.
-            case_name = ""
-            rows = anchor.xpath("./ancestor::tr[1]")
-            if rows:
-                row_text = clean_string(rows[0].text_content())
-                case_name = clean_string(
-                    row_text.replace(docket_number, "", 1)
+            # Case title + internal caseid come from the "Case Query" link.
+            case_name, pacer_case_id = "", None
+            query_links = cells[0].xpath(
+                './/a[contains(@href, "CaseQuery.jsp")]'
+            )
+            if query_links:
+                case_name = clean_string(query_links[0].text_content())
+                q = parse_qs(urlparse(query_links[0].get("href", "")).query)
+                pacer_case_id = (q.get("caseid") or [None])[0]
+
+            # Originating cell: "<origin_code> : <orig number> <origin name>".
+            orig_cell = cells[3]
+            orig_full = clean_string(
+                orig_cell.text_content().replace("\xa0", " ")
+            )
+            originating_case_number = ""
+            originating_court_id = ""
+            originating_docket_url = ""
+            dkt_links = orig_cell.xpath(
+                './/a[contains(@href, "DktRpt.pl") '
+                'or contains(@href, "iquery.pl") '
+                'or contains(@href, "DocketSheet")]'
+            )
+            if dkt_links:
+                originating_docket_url = dkt_links[0].get("href", "")
+                originating_case_number = clean_string(
+                    dkt_links[0].text_content()
                 )
-            if not case_name:
-                case_name = clean_string(anchor.tail or "")
+                originating_court_id = court_id_from_ecf_url(
+                    originating_docket_url
+                )
 
-            key = (docket_number, pacer_case_id)
-            if key in seen:
-                continue
-            seen.add(key)
+            origin_code = ""
+            if ":" in orig_full:
+                origin_code = orig_full.split(":", 1)[0].strip()
+            origin = orig_full
+            if originating_case_number and originating_case_number in orig_full:
+                origin = orig_full.split(originating_case_number, 1)[-1].strip()
+
             results.append(
                 {
-                    "appellate_docket_number": docket_number,
+                    "appellate_docket_number": appellate_docket_number,
                     "case_name": case_name,
                     "pacer_case_id": pacer_case_id,
-                    "url": href,
+                    "appellate_url": summary.get("href", ""),
+                    "opening_date": clean_string(cells[1].text_content()),
+                    # Date and time sit on either side of a <br>; join with a
+                    # space so they don't run together ("...2025" + "10:11...").
+                    "last_docket_entry": clean_string(
+                        " ".join(cells[2].xpath(".//text()")).replace(
+                            "\xa0", " "
+                        )
+                    ),
+                    "originating_case_number": originating_case_number,
+                    "originating_court_id": originating_court_id,
+                    "origin": origin,
+                    "origin_code": origin_code,
+                    "originating_docket_url": originating_docket_url,
                 }
             )
         return results
 
 
-def normalize_docket_number(docket_number):
-    """Strip office/judge decoration so two docket numbers compare equal.
-
-    E.g. ``"1:19-cv-00143-JD"`` and ``"1:19-cv-00143"`` both reduce to
-    ``"1:19-cv-00143"``.
-
-    :param docket_number: A district docket number string.
-    :return: The core docket number, or the cleaned input if it doesn't match.
-    """
-    match = AppellateDocketReport.docket_number_dist_regex.search(
-        docket_number or ""
-    )
-    return match.group(1) if match else clean_string(docket_number or "")
-
-
-def confirm_originating_case(
-    session, appellate_court, appellate_docket_number, originating_case_number
-):
-    """Read an appellate docket's originating info to confirm/annotate a hit.
-
-    :param session: A logged-in PACER session.
-    :param appellate_court: The appellate court id, e.g. ``"ca1"``.
-    :param appellate_docket_number: The appellate docket number, e.g.
-    ``"19-2244"``.
-    :param originating_case_number: The district case number searched for.
-    :return: A dict with the parsed ``originating_court_information`` and a
-    ``matches`` boolean, or ``{"matches": False, "error": ...}`` on failure.
-    """
-    report = AppellateDocketReport(appellate_court, session)
-    try:
-        report.query(appellate_docket_number, show_orig_docket=True)
-    except Exception as exc:  # noqa: BLE001 - report the failure, keep going
-        return {"matches": False, "error": str(exc)}
-
-    info = (report.data or {}).get("originating_court_information") or {}
-    found = normalize_docket_number(info.get("docket_number"))
-    wanted = normalize_docket_number(originating_case_number)
-    return {
-        "matches": bool(found) and found == wanted,
-        "originating_court_information": info,
-    }
-
-
 def search_appellate(
-    session,
-    appellate_court,
-    originating_case_number,
-    search_html=None,
-    confirm=True,
+    session, appellate_court, originating_case_number, search_html=None
 ):
-    """Run (or load) an appellate search and optionally confirm each hit.
+    """Run (or load) an appellate originating-case search.
 
-    :param session: A logged-in PACER session (may be None when only parsing a
-    local results page with confirm disabled).
+    :param session: A logged-in PACER session (unused when ``search_html`` is
+    given).
     :param appellate_court: The appellate court id to search.
     :param originating_case_number: The district case number to search by.
-    :param search_html: Optional path to a saved results page to parse instead
-    of querying PACER.
-    :param confirm: Whether to fetch each hit's appellate docket to confirm the
-    originating case number.
+    :param search_html: Optional path to a saved Case Selection Table to parse
+    instead of querying PACER.
     :return: A results dict ready to serialize to JSON.
     """
     report = AppellateCaseSearch(appellate_court, session)
     if search_html:
-        logger.info("Parsing saved appellate search results: %s", search_html)
+        logger.info("Parsing saved Case Selection Table: %s", search_html)
         report._parse_text(read_html_file(search_html))
     else:
         report.query(originating_case_number)
 
+    wanted = normalize_originating_number(originating_case_number)
     hits = report.data
+    for hit in hits:
+        hit["matches_search"] = (
+            normalize_originating_number(hit["originating_case_number"])
+            == wanted
+        )
+
     logger.info(
-        "Found %s candidate appellate case(s) in %s.", len(hits), appellate_court
+        "Found %s appellate case(s) in %s for originating case '%s'.",
+        len(hits),
+        appellate_court,
+        originating_case_number,
     )
-
-    if confirm and session is not None:
-        for hit in hits:
-            confirmation = confirm_originating_case(
-                session,
-                appellate_court,
-                hit["appellate_docket_number"],
-                originating_case_number,
-            )
-            hit.update(confirmation)
-
-    confirmed = [h for h in hits if h.get("matches")]
     return {
         "appellate_court": appellate_court,
         "originating_case_number": originating_case_number,
-        "confirmed_matches": confirmed,
-        "all_candidates": hits,
+        "results": hits,
     }
 
 
@@ -361,46 +388,39 @@ def parse_args(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
             "Search a U.S. Court of Appeals by originating (district-court) "
-            "case number and return the matching appellate case(s)."
+            "case number and return the matching appellate case(s), each with "
+            "the district court and case number it came from."
         ),
         epilog=(
             "Give the appellate court with --appellate-court, or let it be "
             "derived from --district-court. Use --search-html to parse a saved "
-            "Case Search results page instead of querying PACER live.\n"
+            "Case Selection Table instead of querying PACER live.\n"
         ),
     )
     parser.add_argument(
         "--originating-case-number",
         required=True,
-        help="District court case number to search by, e.g. '1:19-cv-00143'.",
+        help="District court case number to search by, e.g. '17-cv-1545'.",
     )
     parser.add_argument(
         "--district-court",
         default=None,
         help=(
-            "District court id (e.g. 'nhd', 'nysd'); the appellate court is "
-            "derived from it when --appellate-court is not given."
+            "District court id (e.g. 'nysd'); the appellate court is derived "
+            "from it when --appellate-court is not given."
         ),
     )
     parser.add_argument(
         "--appellate-court",
         default=None,
-        help="Appellate court id to search (e.g. 'ca1'). Overrides derivation.",
+        help="Appellate court id to search (e.g. 'ca2'). Overrides derivation.",
     )
     parser.add_argument(
         "--search-html",
         default=None,
         help=(
-            "Path to a saved appellate Case Search results page to parse "
-            "instead of querying PACER (no login needed unless --confirm)."
-        ),
-    )
-    parser.add_argument(
-        "--no-confirm",
-        action="store_true",
-        help=(
-            "Don't fetch each hit's appellate docket to confirm the "
-            "originating case number (saves PACER charges)."
+            "Path to a saved Case Selection Table page to parse instead of "
+            "querying PACER (no login needed)."
         ),
     )
     parser.add_argument(
@@ -460,13 +480,13 @@ def login_if_needed(args, needed):
         return None
     if not args.username:
         sys.exit(
-            "A PACER username is required for live requests. Set "
+            "A PACER username is required for a live search. Set "
             "PACER_USERNAME or pass --username."
         )
     password = resolve_password(args.password)
     if not password:
         sys.exit(
-            "A PACER password is required for live requests. Set "
+            "A PACER password is required for a live search. Set "
             "PACER_PASSWORD, pass --password, or run interactively."
         )
     otp_code = resolve_otp(args.otp)
@@ -483,17 +503,12 @@ def main(argv=None):
     appellate_court = resolve_appellate_court(args)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    confirm = not args.no_confirm
-    # A session is needed for a live search, and for confirming hits.
-    need_session = (args.search_html is None) or confirm
-    session = login_if_needed(args, need_session)
-
+    session = login_if_needed(args, needed=args.search_html is None)
     results = search_appellate(
         session,
         appellate_court,
         args.originating_case_number,
         search_html=args.search_html,
-        confirm=confirm,
     )
 
     base = (
@@ -504,9 +519,8 @@ def main(argv=None):
     save_json(results, out_path)
 
     logger.info(
-        "Done: %s confirmed / %s candidate appellate case(s). Wrote %s",
-        len(results["confirmed_matches"]),
-        len(results["all_candidates"]),
+        "Done: %s appellate case(s). Wrote %s",
+        len(results["results"]),
         os.path.abspath(out_path),
     )
 
