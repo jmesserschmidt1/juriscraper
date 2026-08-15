@@ -24,7 +24,10 @@ attachments and, for a plain report that lacks them, falls back to the inline
 (the codes shown at the top, e.g. ECF, LEAD), its ``lead_case`` /
 ``member_cases`` / ``related_cases`` references (each with docket number,
 court, and pacer_case_id), and its ``cases_in_other_courts`` (court name and
-docket number for cases in another court system, which have no pacer_case_id);
+docket number for cases in another court system, which have no pacer_case_id).
+Each docket entry also carries its source row under an ``html`` key (the entry
+as it appears in the parsed, script-stripped tree), for testing, validation, or
+later re-parsing;
 ``TerminationDocketHistoryReport`` adds the per-entry ``Terminated:`` date the
 history report shows on some motions. Both only add keys -- all of
 Juriscraper's existing parsed output is preserved untouched.
@@ -99,8 +102,14 @@ import os
 import re
 import sys
 
+from lxml.html import tostring
+
 from juriscraper.lib.log_tools import make_default_logger
-from juriscraper.lib.string_utils import clean_string, convert_date_string
+from juriscraper.lib.string_utils import (
+    clean_string,
+    convert_date_string,
+    force_unicode,
+)
 from juriscraper.pacer import (
     DocketHistoryReport,
     DocketReport,
@@ -410,10 +419,21 @@ class AttachmentDocketReport(DocketReport):
     @property
     def docket_entries(self):
         entries = super().docket_entries
-        # Only fall back to inline parsing for entries the stock parser did not
-        # already populate from a structured "view multiple documents" table.
+        self._attach_inline_attachments(entries)
+        self._attach_entry_html(entries)
+        return entries
+
+    def _attach_inline_attachments(self, entries):
+        """Fill in attachments the stock parser dropped (plain-report links).
+
+        :param entries: The list of parsed docket-entry dicts (mutated in
+        place).
+        :return: None
+        """
+        # If the stock parser already populated structured attachments from a
+        # "view multiple documents" table, prefer those and do nothing.
         if any(de.get("attachments") for de in entries):
-            return entries
+            return
         attachments_by_doc_id = self._parse_inline_attachments()
         for de in entries:
             if de.get("attachments"):
@@ -421,7 +441,68 @@ class AttachmentDocketReport(DocketReport):
             attachments = attachments_by_doc_id.get(de.get("pacer_doc_id"))
             if attachments:
                 de["attachments"] = attachments
-        return entries
+
+    def _attach_entry_html(self, entries):
+        """Attach each docket entry's source HTML under an ``html`` key.
+
+        This captures the original ``<tr>`` for each entry (as it appears in
+        the parsed, script-stripped tree the parser works on) so entries can be
+        re-parsed, diffed, or validated later. The rows are collected with the
+        same acceptance logic the stock parser uses, so they line up one-to-one
+        with the parsed entries; if for some reason they don't, the HTML is
+        left off rather than risk mis-pairing.
+
+        :param entries: The list of parsed docket-entry dicts (mutated in
+        place).
+        :return: None
+        """
+        row_htmls = self._entry_row_htmls()
+        if len(row_htmls) != len(entries):
+            logger.warning(
+                "Docket entry row/entry count mismatch (%s rows vs %s "
+                "entries); skipping per-entry HTML.",
+                len(row_htmls),
+                len(entries),
+            )
+            return
+        for de, html in zip(entries, row_htmls):
+            de["html"] = html
+
+    def _entry_row_htmls(self):
+        """Return each accepted docket-entry row's HTML, in parse order.
+
+        Mirrors ``DocketReport.docket_entries``' row selection so the results
+        pair positionally with the parsed entries (attachment sub-rows and
+        blank/continuation rows are skipped, as there).
+
+        :return: A list of HTML strings, one per accepted entry row.
+        """
+        rows = self._get_docket_entry_rows()[1:]  # Skip the header row.
+        view_multiple_documents = bool(
+            self.tree.xpath("//form[@name='view_multi_docs']")
+        )
+        htmls = []
+        for row in rows:
+            cells = row.xpath("./td[not(./input)]")
+            if view_multiple_documents and len(cells) == 4:
+                if not cells[2].text_content().strip():
+                    del cells[2]
+            if view_multiple_documents and len(cells) == 5:
+                del cells[3]
+            if len(cells) == 0:
+                continue
+            if len(cells) == 4:
+                del cells[1]
+            if not force_unicode(cells[0].text_content()).strip():
+                # Blank date cell -> attachment sub-row or continuation.
+                continue
+            document_number = self._get_document_number(cells[1])
+            if document_number is not None and not document_number.isdigit():
+                # e.g. courts that use "doc" instead of a number; the stock
+                # parser skips these, so we do too.
+                continue
+            htmls.append(tostring(row, encoding="unicode"))
+        return htmls
 
     def _parse_inline_attachments(self):
         """Map each entry's main pacer_doc_id to its inline attachments.
