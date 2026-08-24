@@ -824,17 +824,19 @@ def process_docket_html(
     :param output_dir: Directory to write outputs to.
     :param fallback_docket_number: Docket number to use in the filename if the
     report itself doesn't yield one.
-    :param save_source_html: Whether to also write the source HTML next to the
-    JSON (used for live fetches; skipped when parsing an existing local file).
+    :param save_source_html: Whether to also write the source HTML (to
+    {court}/html; used for live fetches; skipped when parsing an existing
+    local file).
     :return: The parsed docket data dict.
     """
     data = _parse_report_data(AttachmentDocketReport, court_id, html_text)
     base = report_basename(
         court_id, data.get("docket_number"), fallback_docket_number, "dkt"
     )
+    html_path, json_path = report_output_paths(output_dir, court_id, base)
     if save_source_html:
-        save_html(html_text, os.path.join(output_dir, f"{base}.html"))
-    save_json(data, os.path.join(output_dir, f"{base}.json"))
+        save_html(html_text, html_path)
+    save_json(data, json_path)
     logger.info(
         "Docket report parsed: %s entries, %s parties, flags=%s, "
         "%s member / %s related cases",
@@ -861,8 +863,9 @@ def process_history_html(
     :param output_dir: Directory to write outputs to.
     :param fallback_docket_number: Docket number to use in the filename if the
     report itself doesn't yield one.
-    :param save_source_html: Whether to also write the source HTML next to the
-    JSON (used for live fetches; skipped when parsing an existing local file).
+    :param save_source_html: Whether to also write the source HTML (to
+    {court}/html; used for live fetches; skipped when parsing an existing
+    local file).
     :return: The parsed docket history data dict.
     """
     data = _parse_report_data(
@@ -871,9 +874,10 @@ def process_history_html(
     base = report_basename(
         court_id, data.get("docket_number"), fallback_docket_number, "hist"
     )
+    html_path, json_path = report_output_paths(output_dir, court_id, base)
     if save_source_html:
-        save_html(html_text, os.path.join(output_dir, f"{base}.html"))
-    save_json(data, os.path.join(output_dir, f"{base}.json"))
+        save_html(html_text, html_path)
+    save_json(data, json_path)
     logger.info(
         "Docket history report parsed: %s entries",
         len(data.get("docket_entries", [])),
@@ -894,6 +898,28 @@ def docket_number_slug(docket_number):
     slug = re.sub(r"[\s:/]+", "-", docket_number.strip())
     # Drop anything else that isn't filename-safe.
     return re.sub(r"[^A-Za-z0-9._-]", "", slug)
+
+
+def report_output_paths(output_dir, court_id, base):
+    """Return the HTML and JSON output paths for a report, creating their dirs.
+
+    Within ``output_dir`` the outputs are grouped by court and split by type:
+    HTML goes to ``{court}/html`` and JSON to ``{court}/json``. The two
+    per-court directories are created if they don't already exist.
+
+    :param output_dir: The top-level output directory.
+    :param court_id: The Juriscraper court id (the per-court grouping folder).
+    :param base: The report basename (without directory or extension).
+    :return: A ``(html_path, json_path)`` tuple.
+    """
+    html_dir = os.path.join(output_dir, court_id, "html")
+    json_dir = os.path.join(output_dir, court_id, "json")
+    os.makedirs(html_dir, exist_ok=True)
+    os.makedirs(json_dir, exist_ok=True)
+    return (
+        os.path.join(html_dir, f"{base}.html"),
+        os.path.join(json_dir, f"{base}.json"),
+    )
 
 
 def report_basename(court_id, docket_number, fallback_docket_number, suffix):
@@ -941,8 +967,9 @@ def scrape_docket(
         # more accurate than fetching a separate attachment page per document.
         show_multiple_docs=True,
     )
-    # Save the fetched HTML alongside the JSON (files are named after the
-    # court and the report's own docket number, e.g. nysd_1-25-cv-09596_dkt).
+    # Save the fetched HTML and the parsed JSON (grouped by court under
+    # {court}/html and {court}/json, and named after the court and the
+    # report's own docket number, e.g. nysd/html/nysd_1-25-cv-09596_dkt.html).
     return process_docket_html(
         court_id,
         report.response.text,
@@ -1043,7 +1070,10 @@ def parse_args(argv=None):
     parser.add_argument(
         "--output-dir",
         default="./pacer_output",
-        help="Directory for the saved HTML and JSON (default: ./pacer_output).",
+        help=(
+            "Directory for the saved output (default: ./pacer_output). Within "
+            "it, HTML is written to {court}/html and JSON to {court}/json."
+        ),
     )
     parser.add_argument(
         "--username",
